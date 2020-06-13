@@ -13,6 +13,7 @@ import tensorflow.keras as k
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 import random
+import numpy as np
 
 seed=1234
 tf.random.set_seed(seed)
@@ -92,21 +93,31 @@ def tokenize(text):
 
 def make_data():
     train_x, train_y, max_len_text, max_len_summary = tokenize(train_texts)
-    train_x = k.preprocessing.sequence.pad_sequences(train_x, maxlen=max_len_text, padding='post', truncating='post', value=0., dtype='int32')
-    train_y = k.preprocessing.sequence.pad_sequences(train_y, maxlen=max_len_summary, padding='post', truncating='post', value=0., dtype='int32')
 
-    train_x, test_x, train_y, test_y = train_test_split(train_x, train_y, random_state=seed, test_size=0.01)
-    train_text, test_text, _, _ = train_test_split(train_texts, [0] * len(train_texts), random_state=seed, test_size=0.01)
-    return train_x, test_x, train_y, test_y, train_text, test_text
+    all_data = list(zip(train_x, train_y))
+    random.shuffle(all_data)
+    train_data = all_data[:90000]
+    test_data = all_data[90000:]
+    train_data = sorted(train_data, key=lambda x:len(x[0]))
+    test_data = sorted(test_data, key=lambda x:len(x[0]))
+    train_x, train_y = zip(*train_data)
+    test_x, test_y = zip(*test_data)
+    return train_x, test_x, train_y, test_y
 
+def padding(x):
+    # padding至batch内的最大长度
+    ml = max([len(i) for i in x])
+    return np.array([i + [0] * (ml - len(i)) for i in x])
 
 
 def data_generator(x, y, batch_size):
     step = len(x) // batch_size
     while 1:
-        n = random.randint(0, step)
-        start_idx = n * batch_size
-        end_idx = (n + 1) * batch_size
-        yield [x[start_idx:end_idx], y[start_idx:end_idx][:, :-1]], y[start_idx:end_idx][:, 1:]
+        for n in range(step):
+            start_idx = n * batch_size
+            end_idx = (n + 1) * batch_size
+            batch_x = padding(x[start_idx:end_idx])
+            batch_y = padding(y[start_idx:end_idx])
+            yield [batch_x, batch_y[:, :-1]], batch_y[:, 1:]
 
 

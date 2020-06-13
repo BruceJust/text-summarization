@@ -15,7 +15,6 @@ from tqdm import tqdm
 import pandas as pd
 from matplotlib import pyplot as plt
 
-
 random.seed(1234)
 tf.random.set_seed(1234)
 
@@ -24,37 +23,74 @@ tf.config.experimental.set_memory_growth(gpus[0], True)
 
 
 
-class Encoder(k.Model):
+class ScaleShift(k.layers.Layer):
+    def __init__(self):
+        super(ScaleShift, self).__init__()
+
+    def build(self, input_shape):
+        kernel_shape = (1,) * (len(input_shape) - 1) + (input_shape[-1], )
+        self.log_scale = self.add_weight(name='log_scale',
+                                         shape=kernel_shape,
+                                         initializer='zeros')
+        self.shift = self.add_weight(name='shift',
+                                     shape=kernel_shape,
+                                     initializer='zeros')
+    def call(self, inputs, **kwargs):
+        x_outs = tf.exp(self.log_scale) * inputs + self.shift
+        return x_outs
+
+def to_one_hot(x, vocab_size):
+    x_mask = tf.cast(tf.greater(tf.expand_dims(x, 2), 0), 'float32')
+    x = tf.one_hot(x, vocab_size)
+    x = tf.reduce_sum(x_mask * x, 1, keepdims=True)
+    x = tf.cast(tf.greater(x, 0.5), 'float32')
+    return x
+
+# s = ScaleShift()
+# x = train_x[0:2]
+
+# x_outs = s(x)
+
+class Encoder(k.layers.Layer):
     def __init__(self, vocab_size, emb_dim, hid_dim):
         super(Encoder, self).__init__()
-        self.emb = k.layers.Embedding(vocab_size, emb_dim)
+        self.vocab_size = vocab_size
+        self.emb = k.layers.Embedding(vocab_size, emb_dim, mask_zero=True)
         self.drop_out = k.layers.Dropout(0.2)
-        self.rnn1 = k.layers.Bidirectional(k.layers.GRU(hid_dim, return_sequences=True, return_state=True), merge_mode='sum')
-        self.rnn2 = k.layers.Bidirectional(k.layers.GRU(hid_dim, return_sequences=True, return_state=True), merge_mode='sum')
-
+        self.rnn1 = k.layers.Bidirectional(k.layers.GRU(hid_dim, return_sequences=True), merge_mode='sum')
+        self.rnn2 = k.layers.Bidirectional(k.layers.GRU(hid_dim, return_sequences=True), merge_mode='sum')
         self.normal1 = k.layers.LayerNormalization()
         self.normal2 = k.layers.LayerNormalization()
+        self.scale = ScaleShift()
+
 
     def call(self, inputs):
         # [batch_size, seq_len, emb_dim]
         embedded = self.emb(inputs)
         embedded = self.drop_out(embedded)
         # [batch_size, seq_len, hid_dim]
-        encoder_outputs, _, _ = self.rnn1(embedded)
-        encoder_outputs, hidden1, hidden2 = self.rnn1(encoder_outputs)
-        encoder_outputs = self.normal1(encoder_outputs)
-        encoder_outputs, hidden1, hidden2 = self.rnn2(encoder_outputs)
-        encoder_outputs = self.normal2(encoder_outputs)
-        encoder_outputs= encoder_outputs * self.compute_mask_(inputs)
-        # hidden = tf.concat([hidden1, hidden2], axis=-1)
-        hidden = hidden1 + hidden2
-        return encoder_outputs, hidden
+        out = self.rnn1(embedded)
+        out = out * self.compute_mask_(inputs)[0]
+        out = self.normal1(out)
+        out = self.rnn2(out)
+        out= out * self.compute_mask_(inputs)[0]
+        out = self.normal2(out)
+
+        # [batch_size, 1, vocab_size]
+        x = to_one_hot(inputs, self.vocab_size)
+        x_prior = self.scale(x)
+        return out, x_prior, self.compute_mask_(inputs)[1]
 
     def compute_mask_(self, inputs):
         mask = tf.logical_not(tf.equal(inputs, 0))
         mask = tf.cast(mask, dtype=tf.float32)
         mask = tf.expand_dims(mask, axis=-1)
-        return mask
+
+        add_mask = tf.equal(inputs, 0)
+        add_mask = tf.cast(add_mask, dtype=tf.float32)
+        add_mask = tf.expand_dims(add_mask, axis=-1)
+        add_mask +=  -1e9
+        return mask, add_mask
 
 # encoder = Encoder(20000, 256, 256)
 # x = tf.ones((64, 140))
@@ -62,7 +98,8 @@ class Encoder(k.Model):
 
 
 
-class Attention(k.Model):
+
+class Attention(k.layers.Layer):
     def __init__(self, hid_dim, heads):
         super(Attention, self).__init__()
         assert hid_dim % heads == 0
@@ -73,7 +110,7 @@ class Attention(k.Model):
         self.key = k.layers.Dense(hid_dim)
         self.value = k.layers.Dense(hid_dim)
 
-    def call(self, encoder_outputs, decoder_input):
+    def call(self, encoder_outputs, decoder_input, mask):
         # encoder_outputs: [batch_size, seq_len_en, hid_dim]
         # decoder_outputs: [batch_size, seq_len_de, hid_dim]
 
@@ -94,7 +131,11 @@ class Attention(k.Model):
 
         # [batch_size, heads, seq_len_q, seq_len_k]
         attention = tf.matmul(qw, kw, transpose_b=True) / self.size_per_head ** 0.5
+        mask = tf.transpose(mask, (0, 2, 1))
+        mask = tf.expand_dims(mask, axis=1)
+        attention += mask
         attention = tf.math.softmax(attention, axis=-1)
+
 
         # [batch_size, heads, seq_len_q, size_per_head]
         out = tf.matmul(attention, vw)
@@ -105,7 +146,7 @@ class Attention(k.Model):
         return out
 
 
-class Decoder(k.Model):
+class Decoder(k.layers.Layer):
     def __init__(self, vocab_size, emb_dim, hid_dim, heads):
         super(Decoder, self).__init__()
         self.emb = k.layers.Embedding(vocab_size, emb_dim)
@@ -115,23 +156,27 @@ class Decoder(k.Model):
         self.normal1 = k.layers.LayerNormalization()
         self.normal2 = k.layers.LayerNormalization()
         self.attention = Attention(hid_dim, heads)
-        self.dense = k.layers.Dense(vocab_size)
+        self.dense = k.layers.Dense(emb_dim, activation='relu')
+        self.dense_out = k.layers.Dense(vocab_size)
+
         
-        
-    def call(self, encoder_outputs, decoder_hidden, decoder_input):
+    def call(self, encoder_outputs, decoder_input, mask):
         # encoder_outputs: [batch_size, seq_len_encoder, hidden_size]
         # decoder_hidden: [batch_size, 1, hidden_size]
         # decoder_input: [batch_size, seq_len_decoder, hidden_size]
         decoder_emb = self.emb(decoder_input)
-        decoder_in = self.attention(encoder_outputs, decoder_emb)
-        h, hidden  = self.rnn1(decoder_in, initial_state=decoder_hidden)
-        h = self.normal1(h)
-        h, hidden  = self.rnn2(h, )
-        h = self.normal2(h)
+        out, _ = self.rnn1(decoder_emb)
+        out = self.normal1(out)
+        out, _  = self.rnn2(out)
+        out = self.normal2(out)
+        attention_out = self.attention(encoder_outputs, out, mask)
+        out = tf.concat([out, attention_out], axis=-1)
+        out = self.dense(out)
 
         # [batch_size, seq_len_decoder, vocab_size]
-        output = self.dense(h)
-        return output, hidden
+        out = self.dense_out(out)
+        return out
+
 
 # decoder = Decoder(20000, 256, 256, 8)
 # decoder_in = tf.ones((64, 30))
@@ -146,10 +191,11 @@ class SummarizationModel(k.Model):
     def call(self, inputs):
         x = inputs[0]
         y_input = inputs[1]
-        encoder_outputs, hidden = self.encoder(x)
+        encoder_outputs, x_prior, encoding_mask = self.encoder(x)
         #
-        output, hidden = self.decoder(encoder_outputs, hidden, y_input)
-        # output = tf.math.softmax(output, axis=-1)
+        output = self.decoder(encoder_outputs, y_input, encoding_mask)
+        output = (output + x_prior) / 2
+        output = tf.math.softmax(output, axis=-1)
         return output
 
 
@@ -159,7 +205,9 @@ hid_dim = 256
 heads = 8
 
 
-loss_object = k.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+loss_object = k.losses.SparseCategoricalCrossentropy(
+    # from_logits=True,
+    reduction='none')
 
 # @tf.function
 def loss_func(y_true, y_pred):
@@ -187,7 +235,8 @@ def masked_accuracy(y_true, y_pred):
 
 def build_model():
     Model = SummarizationModel(vocab_size, emb_dim, hid_dim, heads)
-    Model.compile(optimizer='adam', loss=loss_func, metrics=[masked_accuracy])
+
+    Model.compile(optimizer=k.optimizers.Adam(1e-3), loss=loss_func, metrics=[masked_accuracy])
     return Model
 
 def gen_sent(s, model, topk=3, maxlen=32):
@@ -196,7 +245,7 @@ def gen_sent(s, model, topk=3, maxlen=32):
     """
     # 输入转id
     xid = np.array([tokenizer.encode(s)] * topk)
-    # 解码均以<start>开头，这里<start>的id为2
+    # 解码均以<start>开头，这里<start>的id为1
     yid = np.array([[1]] * topk)
     # 候选答案分数
     scores = [0] * topk
@@ -205,7 +254,7 @@ def gen_sent(s, model, topk=3, maxlen=32):
         # 直接忽略<padding>、<start>
         # model.predict: [3, 1,
         proba = model.predict([xid, yid])
-        proba = tf.math.softmax(proba, axis=-1)
+        # proba = tf.math.softmax(proba, axis=-1)
         proba = proba[:, i, 2:]
         # 取对数，方便计算
         log_proba = np.log(proba + 1e-6)
@@ -243,7 +292,7 @@ def gen_sent(s, model, topk=3, maxlen=32):
     # 如果maxlen字都找不到<end>，直接返回
     return tokenizer.decode_(yid[np.argmax(scores)][1:])
 
-# def gen_sent(sentence):
+# def gen_sent(sentence, model):
 #     summary = ''
 #     tokens = tokenizer.encode(sentence)
 #     tokens = [1] + tokens + [2]
@@ -253,9 +302,10 @@ def gen_sent(s, model, topk=3, maxlen=32):
 #     input_tokens = k.preprocessing.sequence.pad_sequences(input_tokens, padding='post', maxlen=142, value=1.)
 #     start_token = tokenizer.word_to_index['<START>']
 #     decode_token = tf.expand_dims([start_token], axis=0)
-#     encoder_outputs, hidden = model.encoder(input_tokens)
+#     encoder_outputs, hidden, x_prior = model.encoder(input_tokens)
 #     for i in range(max_len):
 #         out_logits, hidden = model.decoder(encoder_outputs, hidden, decode_token)
+#         out_logits = (out_logits + x_prior) / 2
 #         out = tf.math.softmax(out_logits)
 #         out = tf.argmax(out, axis=-1).numpy()[0]
 #         if out[0] != 2:
@@ -286,7 +336,7 @@ tokenizer = Tokenizer()
 batch_size = 128
 epochs = 50
 
-train_x, test_x, train_y, test_y, train_text, test_text = make_data()
+train_x, test_x, train_y, test_y = make_data()
 train_step = len(train_x) // batch_size
 test_step = len(test_x) // batch_size
 
@@ -323,7 +373,7 @@ class evaluate(k.callbacks.Callback):
 
 model_dir = 'model'
 os.makedirs(model_dir, exist_ok=True)
-file_path = os.path.join(model_dir, 'model_basic_normal.hdf5')
+file_path = os.path.join(model_dir, 'model_prior.hdf5')
 
 callbacks = [k.callbacks.ModelCheckpoint(file_path,
                                         monitor='val_loss',
@@ -340,13 +390,19 @@ history = model.fit(train_generator,
                     callbacks=callbacks
                     )
 
+
 def plt_learning_curves(history):
     pd.DataFrame(history.history).plot(figsize=(8, 5))
     plt.grid(True)
-    plt.gca().set_ylim(1.5, 6)
+    plt.gca().set_ylim(2.5, 6)
     plt.show()
 
 plt_learning_curves(history)
+
+min(history.history['loss'])
+min(history.history['val_loss'])
+
+
 # model.save_weights(file_path)
 # model.load_weights(file_path)
 
